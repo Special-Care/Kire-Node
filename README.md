@@ -115,7 +115,7 @@ sudo apt-get update
    * Outbound socket connections inside the local proxy server are strictly bound to `tun0` via `SO_BINDTODEVICE`.
    * If the VPN disconnects, proxy requests are instantly blocked with a `502 Bad Gateway` instead of falling back to the VPS physical IP address.
 4. 🖥️ **Modern Web UI Panel**:
-   * Sleek dark/light responsive console (default port `8787`).
+   * Sleek dark/light responsive console (default port `8888`).
    * Provides real-time geolocation, ISP, ASN, latency, and IP-type (residential/datacenter) detection.
    * Enables manual node selection, blacklist resets, proxy speed-testing, and logs query.
    * Secured by a random secret path suffix (e.g., `/EJsW2EeBo9lY/`) and password authentication.

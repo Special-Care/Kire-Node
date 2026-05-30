@@ -46,7 +46,7 @@ OPENVPN_AUTH_PASS = os.environ.get("OPENVPN_AUTH_PASS", "vpn")
 # 代理端口/账密在首次启动时随机生成,写入 vpngate_data/ui_auth.json。
 # 可用 LOCAL_PROXY_HOST / LOCAL_PROXY_PORT 环境变量在 main() 中覆盖(默认绑 0.0.0.0)。
 UI_HOST = os.environ.get("UI_HOST", "0.0.0.0")
-UI_PORT = int(os.environ.get("UI_PORT", "8787"))
+UI_PORT = int(os.environ.get("UI_PORT", "8888"))
 INVALID_BACKOFF_SECONDS = int(os.environ.get("INVALID_BACKOFF_SECONDS", str(30 * 60)))
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
@@ -148,7 +148,7 @@ def load_ui_config() -> dict[str, Any]:
             "secret_path": "EJsW2EeBo9lY",
             "password": "",
             "host": "0.0.0.0",
-            "port": 8787,
+            "port": 8888,
             "proxy_port": 0,
             "proxy_username": "",
             "proxy_password": "",
@@ -270,7 +270,7 @@ def get_state() -> dict[str, Any]:
 
     # Pre-populate settings inputs in UI
     state["username"] = ui_cfg.get("username", "admin")
-    state["port"] = ui_cfg.get("port", 8787)
+    state["port"] = ui_cfg.get("port", 8888)
     state["secret_path"] = ui_cfg.get("secret_path", "EJsW2EeBo9lY")
     
     return state
@@ -382,30 +382,14 @@ def fetch_candidates() -> list[dict[str, Any]]:
                 log_to_json("ERROR", "Main", f"获取官方 API 节点失败: {e}")
                 raise
                 
-    # 用 ip_cache.json 预过滤:已知是 proxy/hosting 的 IP 直接丢弃,
-    # 不再浪费 OpenVPN 握手测试。未缓存的 IP 留到测试后再判断。
-    ip_cache = vpn_utils.load_ip_cache()
-    filtered: list[dict[str, Any]] = []
-    dropped = 0
-    for n in candidates:
-        ip = n.get("ip") or n.get("remote_host")
-        cached_type = ip_cache.get(ip, {}).get("ip_type", "") if ip else ""
-        if cached_type in vpn_utils.EXCLUDED_IP_TYPES:
-            dropped += 1
-            continue
-        filtered.append(n)
-    if dropped > 0:
-        print(f"[fetch_candidates] 缓存命中丢弃 {dropped} 个代理/机房 IP 候选节点", flush=True)
-        log_to_json("INFO", "Main", f"缓存命中丢弃 {dropped} 个代理/机房 IP 候选节点")
-
     set_state(
         last_fetch_at=time.time(),
         last_fetch_status="ok",
-        last_fetch_message=f"Fetched {len(filtered)} unique candidates across multiple attempts.",
+        last_fetch_message=f"Fetched {len(candidates)} unique candidates across multiple attempts.",
         blacklisted_nodes=len(blacklist),
     )
-    log_to_json("INFO", "Main", f"成功获取官方 API 节点，共 {len(filtered)} 个候选节点(过滤后)")
-    return filtered
+    log_to_json("INFO", "Main", f"成功获取官方 API 节点，共 {len(candidates)} 个候选节点")
+    return candidates
 
 def cached_nodes() -> list[dict[str, Any]]:
     return read_json(NODES_FILE, [])
@@ -745,16 +729,6 @@ def test_node_by_id(node_id: str) -> dict[str, Any]:
                 node["ip_type"] = temp_node["ip_type"]
                 node["quality"] = temp_node["quality"]
 
-            # 测出是代理/机房 IP 就从池里直接删掉
-            if node.get("ip_type") in vpn_utils.EXCLUDED_IP_TYPES:
-                dropped_type = node.get("ip_type")
-                nodes = [item for item in nodes if item.get("id") != node_id]
-                write_json(NODES_FILE, sort_all_nodes(nodes))
-                print(f"[test_node_by_id] 丢弃 {dropped_type} 类型节点: {node_id}", flush=True)
-                log_to_json("INFO", "VPN", f"丢弃 {dropped_type} 类型节点: {node_id}")
-                node["_dropped"] = True
-                return node
-
             sorted_nodes = sort_all_nodes(nodes)
             write_json(NODES_FILE, sorted_nodes)
             res = next((item for item in sorted_nodes if item.get("id") == node_id), node)
@@ -839,17 +813,10 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
                 
     with lock:
         current_nodes = read_json(NODES_FILE, [])
-        excluded_ids: set[str] = set()
         for n in current_nodes:
             nid = n.get("id")
             if nid in updated_nodes_map:
                 n.update(updated_nodes_map[nid])
-                if n.get("ip_type") in vpn_utils.EXCLUDED_IP_TYPES:
-                    excluded_ids.add(nid)
-        if excluded_ids:
-            current_nodes = [n for n in current_nodes if n.get("id") not in excluded_ids]
-            print(f"[test_multiple_nodes] 丢弃 {len(excluded_ids)} 个代理/机房 IP 节点", flush=True)
-            log_to_json("INFO", "VPN", f"丢弃 {len(excluded_ids)} 个代理/机房 IP 节点")
         sorted_nodes = sort_all_nodes(current_nodes)
         write_json(NODES_FILE, sorted_nodes)
 
@@ -880,14 +847,13 @@ def auto_switch_node(attempt: int = 0, *, prev_node_id: str = "") -> None:
         print("[自动切换] 连续切换失败已达 3 次，停止切换以防止主线程死锁，将在后台重新加载节点...", flush=True)
         return
 
-    # 收集可用候选(过滤掉当前活动节点和代理/机房 IP),按延迟从小到大排,挑延迟最低的
+    # 收集可用候选(过滤掉当前活动节点),按延迟从小到大排,挑延迟最低的
     with lock:
         nodes = read_json(NODES_FILE, [])
         candidates = [
             n for n in nodes
             if n.get("probe_status") == "available"
             and not n.get("active")
-            and n.get("ip_type") not in vpn_utils.EXCLUDED_IP_TYPES
         ]
         candidates.sort(key=lambda n: (parse_int(n.get("latency_ms")) or 999999, -parse_int(n.get("score"))))
 
@@ -1087,14 +1053,6 @@ def maintain_valid_nodes(force: bool = False) -> str:
                         config_path.write_text(n["config_text"], encoding="utf-8")
                     except Exception:
                         pass
-
-            # 清扫历史遗留:nodes.json 里之前测出但未清理的代理/机房 IP
-            before = len(merged)
-            merged = [n for n in merged if n.get("ip_type") not in vpn_utils.EXCLUDED_IP_TYPES]
-            scrubbed = before - len(merged)
-            if scrubbed > 0:
-                print(f"[维护线程] 清扫历史遗留的 {scrubbed} 个代理/机房 IP 节点", flush=True)
-                log_to_json("INFO", "Main", f"清扫历史遗留的 {scrubbed} 个代理/机房 IP 节点")
 
             write_json(NODES_FILE, merged)
 
@@ -2408,7 +2366,7 @@ INDEX_HTML = r"""<!doctype html>
           
           <div class="form-group" style="margin-bottom: 12px;">
             <label class="form-label" for="settings_port">网页端口</label>
-            <input type="number" id="settings_port" class="input-field" required min="1" max="65535" placeholder="8787">
+            <input type="number" id="settings_port" class="input-field" required min="1" max="65535" placeholder="8888">
           </div>
           
           <div class="form-group" style="margin-bottom: 12px;">
@@ -3103,7 +3061,7 @@ function openSettingsModal() {
   $("settings_form").reset();
   
   if (state) {
-    $("settings_port").value = state.port || 8787;
+    $("settings_port").value = state.port || 8888;
     $("settings_suffix").value = state.secret_path || "EJsW2EeBo9lY";
     $("settings_proxy_port").value = state.proxy_port || "";
     $("settings_proxy_username").value = state.proxy_username || "";

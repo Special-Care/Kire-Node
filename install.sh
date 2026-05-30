@@ -141,7 +141,7 @@ def generate_random_suffix():
 def load_ui_cfg():
     import json
     path = "/opt/kire-node/vpngate_data/ui_auth.json"
-    cfg = {"host": "0.0.0.0", "port": 8787, "secret_path": "EJsW2EeBo9lY", "password": "",
+    cfg = {"host": "0.0.0.0", "port": 8888, "secret_path": "EJsW2EeBo9lY", "password": "",
            "proxy_port": 0, "proxy_username": "", "proxy_password": ""}
     if os.path.exists(path):
         try:
@@ -312,7 +312,7 @@ def print_line(text=""):
 
 def print_status():
     cfg = load_ui_cfg()
-    ui_port = cfg.get("port", 8787)
+    ui_port = cfg.get("port", 8888)
     secret_path = cfg.get("secret_path", "EJsW2EeBo9lY")
     proxy_port = int(cfg.get("proxy_port") or 0)
     proxy_user = cfg.get("proxy_username", "")
@@ -556,7 +556,7 @@ def configure_port():
     print("=======================================================")
     print("                      管理端口配置                     ")
     print("=======================================================")
-    print(f"当前网页管理端口为: {cfg.get('port', 8787)}")
+    print(f"当前网页管理端口为: {cfg.get('port', 8888)}")
     try:
         val = input("请输入新的管理端口 (1-65535, 按回车取消): ").strip()
         if val:
@@ -668,7 +668,7 @@ def get_status_state():
     state = load_state()
     proxy_port = int(cfg.get("proxy_port") or 0)
     return (
-        cfg.get("port", 8787),
+        cfg.get("port", 8888),
         cfg.get("secret_path", "EJsW2EeBo9lY"),
         cfg.get("username", "未配置"),
         cfg.get("password", ""),
@@ -834,7 +834,7 @@ if [ ! -f "$AUTH_FILE" ]; then
     read -p "是否自定义配置？[y/N]: " is_custom
 
     # Initialize defaults
-    UI_PORT=8787
+    UI_PORT=8888
     # generate random secret suffix (12 chars alphanumeric)
     SECRET_PATH=$(python3 -c "import random, string; print(''.join(random.choices(string.ascii_letters + string.digits, k=12)))")
     # generate random password helpers
@@ -895,9 +895,9 @@ while True:
     if [[ "$is_custom" =~ ^[Yy]$ ]]; then
         # 1. Web UI port
         while true; do
-            read -p "请输入自定义管理端口 [1-65535, 默认 8787]: " input_port
+            read -p "请输入自定义管理端口 [1-65535, 默认 8888]: " input_port
             if [ -z "$input_port" ]; then
-                UI_PORT=8787
+                UI_PORT=8888
                 break
             fi
             if [[ "$input_port" =~ ^[0-9]+$ ]] && [ "$input_port" -ge 1 ] && [ "$input_port" -le 65535 ]; then
@@ -1047,7 +1047,7 @@ fi
 SECRET_PATH="EJsW2EeBo9lY"
 USERNAME="未配置"
 PASSWORD="未配置"
-UI_PORT=8787
+UI_PORT=8888
 PROXY_PORT_DISPLAY="未配置"
 PROXY_USER_DISPLAY="未配置"
 PROXY_PWD_DISPLAY="未配置"
@@ -1056,7 +1056,7 @@ if [ -f "$AUTH_FILE" ]; then
     SECRET_PATH=$(python3 -c "import json; print(json.load(open('$AUTH_FILE')).get('secret_path', 'EJsW2EeBo9lY'))" 2>/dev/null || echo "EJsW2EeBo9lY")
     USERNAME=$(python3 -c "import json; print(json.load(open('$AUTH_FILE')).get('username', '未配置'))" 2>/dev/null || echo "未配置")
     PASSWORD=$(python3 -c "import json; print(json.load(open('$AUTH_FILE')).get('password', '未配置'))" 2>/dev/null || echo "未配置")
-    UI_PORT=$(python3 -c "import json; print(json.load(open('$AUTH_FILE')).get('port', 8787))" 2>/dev/null || echo "8787")
+    UI_PORT=$(python3 -c "import json; print(json.load(open('$AUTH_FILE')).get('port', 8888))" 2>/dev/null || echo "8888")
     PROXY_PORT_DISPLAY=$(python3 -c "import json; print(json.load(open('$AUTH_FILE')).get('proxy_port', '未配置'))" 2>/dev/null || echo "未配置")
     PROXY_USER_DISPLAY=$(python3 -c "import json; print(json.load(open('$AUTH_FILE')).get('proxy_username', '未配置'))" 2>/dev/null || echo "未配置")
     PROXY_PWD_DISPLAY=$(python3 -c "import json; print(json.load(open('$AUTH_FILE')).get('proxy_password', '未配置'))" 2>/dev/null || echo "未配置")
@@ -1084,5 +1084,27 @@ echo -e "  * 查看实时日志:   ${YELLOW}kire logs${PLAIN}"
 echo -e "  * 停止服务:       ${YELLOW}kire stop${PLAIN}"
 echo -e "  * 重启服务:       ${YELLOW}kire restart${PLAIN}"
 echo -e "=========================================================="
-echo -e "${RED}!!! 重要:代理已开放公网访问。请务必通过防火墙/安全组保护 ${PROXY_PORT_DISPLAY} 端口,只允许信任来源访问,避免被滥用导致 VPS 被封。${PLAIN}"
+echo -e "${RED}!!! 重要:代理已开放公网访问,务必用防火墙锁定 ${PROXY_PORT_DISPLAY} 端口的来源 IP,否则会被扫到滥用甚至 VPS 被封。${PLAIN}"
+echo
+echo -e "${YELLOW}【防火墙快速配置(UFW)】${PLAIN}"
+echo -e "  把下面的 ${BLUE}<信任客户端IP>${PLAIN} 替换成你跑 Xray/3x-ui 那台机器的公网 IP:"
+echo -e ""
+echo -e "  # 1) 启用 UFW(首次启用前别忘了先放行 SSH,否则会断连!)"
+echo -e "  ${GREEN}sudo ufw allow 22/tcp${PLAIN}"
+echo -e "  ${GREEN}sudo ufw default deny incoming${PLAIN}"
+echo -e "  ${GREEN}sudo ufw default allow outgoing${PLAIN}"
+echo -e "  ${GREEN}sudo ufw enable${PLAIN}"
+echo -e ""
+echo -e "  # 2) 放行 KireNode Web UI 和代理端口给信任 IP"
+echo -e "  ${GREEN}sudo ufw allow from <信任客户端IP> to any port ${UI_PORT} proto tcp${PLAIN}     # Web UI"
+echo -e "  ${GREEN}sudo ufw allow from <信任客户端IP> to any port ${PROXY_PORT_DISPLAY} proto tcp${PLAIN}     # 代理"
+echo -e ""
+echo -e "  # 3) 撤销 / 关闭(替换 IP 后执行)"
+echo -e "  ${GREEN}sudo ufw delete allow from <信任客户端IP> to any port ${PROXY_PORT_DISPLAY} proto tcp${PLAIN}"
+echo -e "  ${GREEN}sudo ufw deny ${PROXY_PORT_DISPLAY}/tcp${PLAIN}     # 应急:彻底封掉代理端口"
+echo -e ""
+echo -e "  # 4) 验证"
+echo -e "  ${GREEN}sudo ufw status numbered${PLAIN}     # 看现有规则,可用编号删除单条"
+echo -e ""
+echo -e "  ${YELLOW}多个信任来源就重复第 2 步;阿里云/腾讯云/AWS 还要在控制台安全组里同样配一遍 —— 任意一层放行 0.0.0.0/0 都等于裸奔。${PLAIN}"
 echo

@@ -18,10 +18,6 @@ IP_CACHE_FILE = DATA_DIR / "ip_cache.json"
 
 ip_cache_lock = threading.RLock()
 
-# ip-api.com 返回的 ip_type 中,这些类别会被节点池直接丢弃。
-# residential / mobile 保留;proxy 和 hosting(机房/数据中心)排除。
-EXCLUDED_IP_TYPES = frozenset({"proxy", "hosting"})
-
 COUNTRY_TRANSLATIONS = {
     "Japan": "日本",
     "Korea Republic of": "韩国",

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-KireNode is a VPN proxy gateway for Linux VPS (Ubuntu only). The Python service auto-fetches VPNGate nodes, dials one over OpenVPN onto a `tun0` adapter under a private policy-routing table, and exposes a SOCKS5/HTTP proxy (binds `0.0.0.0:<random high port>`, mandatory username/password auth — RFC 1929 for SOCKS5, HTTP Basic for HTTP) plus a web admin UI (port 8787). Designed to be the egress for an upstream Xray/3x-ui across the public internet.
+KireNode is a VPN proxy gateway for Linux VPS (Ubuntu only). The Python service auto-fetches VPNGate nodes, dials one over OpenVPN onto a `tun0` adapter under a private policy-routing table, and exposes a SOCKS5/HTTP proxy (binds `0.0.0.0:<random high port>`, mandatory username/password auth — RFC 1929 for SOCKS5, HTTP Basic for HTTP) plus a web admin UI (port 8888). Designed to be the egress for an upstream Xray/3x-ui across the public internet.
 
 No build, no tests, no lint. Source is plain Python 3 executed by `systemd` on the target VPS.
 
