@@ -78,10 +78,10 @@ sudo apt-get update
 ### ⚙️ 系统架构
 
 ```
-   [ 3x-ui / Xray ] 
-         │ (HTTP / SOCKS5)
+   [ 远程客户端 / 3x-ui / Xray ]
+         │ (HTTP / SOCKS5 + 用户名密码鉴权,公网 IP 接入)
          ▼
-   [ 本地代理服务器 ] (Port 7928) ──(强制绑定 SO_BINDTODEVICE)──► [ tun0 虚拟网卡 ]
+   [ 代理服务 ] (0.0.0.0:<随机端口>) ──(强制绑定 SO_BINDTODEVICE)──► [ tun0 虚拟网卡 ]
          │                                                            │
          │ (SSH, Web UI, etc. 依然走物理路由)                           │ (策略路由表 100)
          ▼                                                            ▼

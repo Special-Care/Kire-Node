@@ -43,8 +43,8 @@ OPENVPN_TEST_TIMEOUT_SECONDS = int(os.environ.get("OPENVPN_TEST_TIMEOUT_SECONDS"
 OPENVPN_CMD = os.environ.get("OPENVPN_CMD", "openvpn")
 OPENVPN_AUTH_USER = os.environ.get("OPENVPN_AUTH_USER", "vpn")
 OPENVPN_AUTH_PASS = os.environ.get("OPENVPN_AUTH_PASS", "vpn")
-LOCAL_PROXY_HOST = os.environ.get("LOCAL_PROXY_HOST", "127.0.0.1")
-LOCAL_PROXY_PORT = int(os.environ.get("LOCAL_PROXY_PORT", "7928"))
+# 代理端口/账密在首次启动时随机生成,写入 vpngate_data/ui_auth.json。
+# 可用 LOCAL_PROXY_HOST / LOCAL_PROXY_PORT 环境变量在 main() 中覆盖(默认绑 0.0.0.0)。
 UI_HOST = os.environ.get("UI_HOST", "0.0.0.0")
 UI_PORT = int(os.environ.get("UI_PORT", "8787"))
 INVALID_BACKOFF_SECONDS = int(os.environ.get("INVALID_BACKOFF_SECONDS", str(30 * 60)))
@@ -106,7 +106,7 @@ def generate_random_username() -> str:
     import string
     chars = string.ascii_letters + string.digits
     while True:
-        uname = "".join(random.choices(chars, k=12))
+        uname = "".join(random.choices(chars, k=6))
         # Ensure it starts with a letter and contains at least one lowercase, one uppercase, and one digit
         if uname[0].isalpha():
             has_lower = any(c.islower() for c in uname)
@@ -114,6 +114,31 @@ def generate_random_username() -> str:
             has_digit = any(c.isdigit() for c in uname)
             if has_lower and has_upper and has_digit:
                 return uname
+
+def _port_is_free(port: int, host: str = "0.0.0.0") -> bool:
+    """临时占一下端口看能不能 bind,能就是空闲。"""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind((host, port))
+        return True
+    except OSError:
+        return False
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+
+def pick_free_random_port(low: int = 10000, high: int = 65535, attempts: int = 50) -> int:
+    """在 [low, high] 内随机挑空闲端口,挑不到就返回最后一次候选,留给上层报错。"""
+    last_candidate = random.randint(low, high)
+    for _ in range(attempts):
+        candidate = random.randint(low, high)
+        if _port_is_free(candidate):
+            return candidate
+        last_candidate = candidate
+    return last_candidate
 
 def load_ui_config() -> dict[str, Any]:
     with lock:
@@ -123,7 +148,11 @@ def load_ui_config() -> dict[str, Any]:
             "secret_path": "EJsW2EeBo9lY",
             "password": "",
             "host": "0.0.0.0",
-            "port": 8787
+            "port": 8787,
+            "proxy_port": 0,
+            "proxy_username": "",
+            "proxy_password": "",
+            "auto_switch_enabled": True,
         }
         updated = False
         if auth_file.exists():
@@ -133,22 +162,38 @@ def load_ui_config() -> dict[str, Any]:
                     config[key] = val
             except Exception:
                 pass
-        
+
         if not config.get("username"):
             config["username"] = generate_random_username()
             updated = True
-            
+
         if not config.get("password"):
             config["password"] = generate_random_password()
             updated = True
-            
+
+        try:
+            pp = int(config.get("proxy_port") or 0)
+        except (TypeError, ValueError):
+            pp = 0
+        if not (1024 <= pp <= 65535):
+            config["proxy_port"] = pick_free_random_port()
+            updated = True
+
+        if not config.get("proxy_username"):
+            config["proxy_username"] = generate_random_username()
+            updated = True
+
+        if not config.get("proxy_password"):
+            config["proxy_password"] = generate_random_password()
+            updated = True
+
         if not auth_file.exists() or updated:
             try:
                 DATA_DIR.mkdir(exist_ok=True, parents=True)
                 auth_file.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
             except Exception:
                 pass
-                
+
         return config
 
 def get_session_token(password: str, username: str = "admin") -> str:
@@ -202,19 +247,28 @@ def set_state(**updates: Any) -> None:
 def get_state() -> dict[str, Any]:
     global active_openvpn_node_id, is_connecting
     state = read_json(STATE_FILE, {})
+    ui_cfg = load_ui_config()
     state["active_openvpn_node_id"] = active_openvpn_node_id
     state["is_connecting"] = is_connecting
     state.setdefault("api_url", API_URL)
     state.setdefault("target_valid_nodes", TARGET_VALID_NODES)
     state.setdefault("fetch_interval_seconds", FETCH_INTERVAL_SECONDS)
     state.setdefault("check_interval_seconds", CHECK_INTERVAL_SECONDS)
-    state.setdefault("local_proxy", f"http://{LOCAL_PROXY_HOST}:{LOCAL_PROXY_PORT}")
+    state["proxy_port"] = int(ui_cfg.get("proxy_port") or 0)
+    state["proxy_username"] = ui_cfg.get("proxy_username", "")
+    state["proxy_password"] = ui_cfg.get("proxy_password", "")
+    state["auto_switch_enabled"] = bool(ui_cfg.get("auto_switch_enabled", True))
     state.setdefault("last_fetch_status", "not_started")
     state.setdefault("last_check_message", "")
     state.setdefault("blacklisted_nodes", 0)
-    
+
+    # 暴露给 UI 拼接代理访问地址
+    try:
+        state["server_public_ip"] = (DATA_DIR / "public_ip.txt").read_text(encoding="utf-8").strip()
+    except Exception:
+        state["server_public_ip"] = ""
+
     # Pre-populate settings inputs in UI
-    ui_cfg = load_ui_config()
     state["username"] = ui_cfg.get("username", "admin")
     state["port"] = ui_cfg.get("port", 8787)
     state["secret_path"] = ui_cfg.get("secret_path", "EJsW2EeBo9lY")
@@ -328,14 +382,30 @@ def fetch_candidates() -> list[dict[str, Any]]:
                 log_to_json("ERROR", "Main", f"获取官方 API 节点失败: {e}")
                 raise
                 
+    # 用 ip_cache.json 预过滤:已知是 proxy/hosting 的 IP 直接丢弃,
+    # 不再浪费 OpenVPN 握手测试。未缓存的 IP 留到测试后再判断。
+    ip_cache = vpn_utils.load_ip_cache()
+    filtered: list[dict[str, Any]] = []
+    dropped = 0
+    for n in candidates:
+        ip = n.get("ip") or n.get("remote_host")
+        cached_type = ip_cache.get(ip, {}).get("ip_type", "") if ip else ""
+        if cached_type in vpn_utils.EXCLUDED_IP_TYPES:
+            dropped += 1
+            continue
+        filtered.append(n)
+    if dropped > 0:
+        print(f"[fetch_candidates] 缓存命中丢弃 {dropped} 个代理/机房 IP 候选节点", flush=True)
+        log_to_json("INFO", "Main", f"缓存命中丢弃 {dropped} 个代理/机房 IP 候选节点")
+
     set_state(
         last_fetch_at=time.time(),
         last_fetch_status="ok",
-        last_fetch_message=f"Fetched {len(candidates)} unique candidates across multiple attempts.",
+        last_fetch_message=f"Fetched {len(filtered)} unique candidates across multiple attempts.",
         blacklisted_nodes=len(blacklist),
     )
-    log_to_json("INFO", "Main", f"成功获取官方 API 节点，共 {len(candidates)} 个候选节点")
-    return candidates
+    log_to_json("INFO", "Main", f"成功获取官方 API 节点，共 {len(filtered)} 个候选节点(过滤后)")
+    return filtered
 
 def cached_nodes() -> list[dict[str, Any]]:
     return read_json(NODES_FILE, [])
@@ -674,7 +744,17 @@ def test_node_by_id(node_id: str) -> dict[str, Any]:
                 node["location"] = temp_node["location"]
                 node["ip_type"] = temp_node["ip_type"]
                 node["quality"] = temp_node["quality"]
-            
+
+            # 测出是代理/机房 IP 就从池里直接删掉
+            if node.get("ip_type") in vpn_utils.EXCLUDED_IP_TYPES:
+                dropped_type = node.get("ip_type")
+                nodes = [item for item in nodes if item.get("id") != node_id]
+                write_json(NODES_FILE, sort_all_nodes(nodes))
+                print(f"[test_node_by_id] 丢弃 {dropped_type} 类型节点: {node_id}", flush=True)
+                log_to_json("INFO", "VPN", f"丢弃 {dropped_type} 类型节点: {node_id}")
+                node["_dropped"] = True
+                return node
+
             sorted_nodes = sort_all_nodes(nodes)
             write_json(NODES_FILE, sorted_nodes)
             res = next((item for item in sorted_nodes if item.get("id") == node_id), node)
@@ -759,39 +839,69 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
                 
     with lock:
         current_nodes = read_json(NODES_FILE, [])
+        excluded_ids: set[str] = set()
         for n in current_nodes:
             nid = n.get("id")
             if nid in updated_nodes_map:
                 n.update(updated_nodes_map[nid])
+                if n.get("ip_type") in vpn_utils.EXCLUDED_IP_TYPES:
+                    excluded_ids.add(nid)
+        if excluded_ids:
+            current_nodes = [n for n in current_nodes if n.get("id") not in excluded_ids]
+            print(f"[test_multiple_nodes] 丢弃 {len(excluded_ids)} 个代理/机房 IP 节点", flush=True)
+            log_to_json("INFO", "VPN", f"丢弃 {len(excluded_ids)} 个代理/机房 IP 节点")
         sorted_nodes = sort_all_nodes(current_nodes)
         write_json(NODES_FILE, sorted_nodes)
-        
+
     return list(updated_nodes_map.values())
 
-def auto_switch_node(attempt: int = 0) -> None:
+def auto_switch_node(attempt: int = 0, *, prev_node_id: str = "") -> None:
+    # 顶层入口:开关关闭时,对当前/上一个活动节点持续重连,不换 IP。
+    # 没有可重试节点的情况(冷启动)落到下面的随机挑选,toggle 只控制"故障切换"。
+    if attempt == 0:
+        cfg = load_ui_config()
+        if not bool(cfg.get("auto_switch_enabled", True)):
+            retry_id = prev_node_id or active_openvpn_node_id
+            if retry_id:
+                msg = f"故障自动切换已禁用，正在对当前节点 {retry_id} 持续重连..."
+                print(f"[自动切换] {msg}", flush=True)
+                log_to_json("INFO", "VPN", msg)
+                try:
+                    connect_node(retry_id)
+                except Exception as e:
+                    err = f"重试当前节点 {retry_id} 失败: {e}，下次故障检测时将继续重试"
+                    print(f"[自动切换] {err}", flush=True)
+                    log_to_json("WARNING", "VPN", err)
+                    set_state(last_check_message=err)
+                return
+            # 无可重试目标,允许走下面的随机挑选(等同于冷启动初次连接)
+
     if attempt >= 3:
         print("[自动切换] 连续切换失败已达 3 次，停止切换以防止主线程死锁，将在后台重新加载节点...", flush=True)
         return
-        
-    # Find the next best available node
+
+    # 收集可用候选(过滤掉当前活动节点和代理/机房 IP),按延迟从小到大排,挑延迟最低的
     with lock:
         nodes = read_json(NODES_FILE, [])
         candidates = [
-            n for n in nodes 
-            if n.get("probe_status") == "available" 
+            n for n in nodes
+            if n.get("probe_status") == "available"
             and not n.get("active")
+            and n.get("ip_type") not in vpn_utils.EXCLUDED_IP_TYPES
         ]
         candidates.sort(key=lambda n: (parse_int(n.get("latency_ms")) or 999999, -parse_int(n.get("score"))))
-        
+
     if candidates:
         next_node = candidates[0]
-        msg = f"当前连接已失效或代理连通性检测失败，正在自动切换至最佳备用节点: {next_node['id']}"
+        next_latency = parse_int(next_node.get("latency_ms"))
+        latency_label = f"{next_latency} ms" if next_latency > 0 else "未知延迟"
+        msg = f"当前连接已失效或代理连通性检测失败，已从 {len(candidates)} 个可用节点中选出延迟最低的备用节点: {next_node['id']} ({latency_label})"
         print(f"[自动切换] {msg}", flush=True)
         log_to_json("INFO", "VPN", msg)
         try:
             connect_node(next_node["id"])
         except Exception as e:
-            err_msg = f"切换到备用节点 {next_node['id']} 失败: {e}，将尝试下一个..."
+            err_msg = f"切换到备用节点 {next_node['id']} 失败: {e}，将尝试次低延迟节点..."
             print(f"[自动切换] {err_msg}", flush=True)
             log_to_json("WARNING", "VPN", err_msg)
             auto_switch_node(attempt + 1)
@@ -887,7 +997,7 @@ def connect_node(node_id: str) -> str:
         for item in nodes:
             item["active"] = item.get("id") == node_id
             if item["active"]:
-                item["probe_message"] = f"Active node. HTTP proxy: http://{LOCAL_PROXY_HOST}:{LOCAL_PROXY_PORT}"
+                item["probe_message"] = "Active node."
         write_json(NODES_FILE, nodes)
         
         set_state(last_check_message="正在测试本地代理出站联通性与出口 IP...")
@@ -925,14 +1035,16 @@ def maintain_valid_nodes(force: bool = False) -> str:
                 stop_active_openvpn()
         elif not active_openvpn_running():
             has_active_id = False
+            prev_id = ""
             with lock:
                 if active_openvpn_node_id:
                     has_active_id = True
+                    prev_id = active_openvpn_node_id
                     stop_active_openvpn()
             if has_active_id:
                 print("[维护线程] 检测到当前 OpenVPN 进程已意外退出，准备自动切换节点", flush=True)
                 is_connecting = False
-                auto_switch_node()
+                auto_switch_node(prev_node_id=prev_id)
                 is_connecting = True
 
         try:
@@ -975,7 +1087,15 @@ def maintain_valid_nodes(force: bool = False) -> str:
                         config_path.write_text(n["config_text"], encoding="utf-8")
                     except Exception:
                         pass
-                        
+
+            # 清扫历史遗留:nodes.json 里之前测出但未清理的代理/机房 IP
+            before = len(merged)
+            merged = [n for n in merged if n.get("ip_type") not in vpn_utils.EXCLUDED_IP_TYPES]
+            scrubbed = before - len(merged)
+            if scrubbed > 0:
+                print(f"[维护线程] 清扫历史遗留的 {scrubbed} 个代理/机房 IP 节点", flush=True)
+                log_to_json("INFO", "Main", f"清扫历史遗留的 {scrubbed} 个代理/机房 IP 节点")
+
             write_json(NODES_FILE, merged)
 
         # Test the first 10 non-active nodes from the new list
@@ -2195,9 +2315,9 @@ INDEX_HTML = r"""<!doctype html>
           <svg xmlns="http://www.w3.org/2000/svg" class="stat-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" style="color: var(--primary);"><path stroke-linecap="round" stroke-linejoin="round" d="M8.111 16.404a5.5 5.5 0 017.778 0M12 20h.01m-7.08-7.071a10.5 10.5 0 0114.14 0M1.414 8.05a16 16 0 0121.172 0" /></svg>
         </div>
         <div>
-          <h3 style="margin: 0 0 4px 0; font-size: 16px; font-weight: 600; color: var(--text-primary);">本地代理出口检测 (Port 7928)</h3>
+          <h3 style="margin: 0 0 4px 0; font-size: 16px; font-weight: 600; color: var(--text-primary);">代理出口检测 <span id="proxy-port-label" style="color: var(--text-secondary); font-weight: 500; font-size: 14px;"></span></h3>
           <p style="margin: 0; font-size: 13px; color: var(--text-secondary);">
-            测试本地 HTTP/SOCKS5 代理是否成功通过当前 VPN 节点出站，并获取实际出口公网 IP 和延迟。
+            测试 HTTP/SOCKS5 代理是否成功通过当前 VPN 节点出站，并获取实际出口公网 IP 和延迟。
           </p>
         </div>
       </div>
@@ -2306,7 +2426,38 @@ INDEX_HTML = r"""<!doctype html>
             <input type="password" id="settings_new_password" class="input-field" placeholder="留空则不修改">
           </div>
         </div>
-        
+
+        <div style="border-bottom: 1px solid rgba(255,255,255,0.05); padding-bottom: 16px; margin-bottom: 16px;">
+          <div style="font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-secondary); font-weight: 600; margin-bottom: 12px;">修改 HTTP/SOCKS5 代理配置</div>
+
+          <div class="form-group" style="margin-bottom: 12px;">
+            <label class="form-label" for="settings_proxy_port">代理端口</label>
+            <input type="number" id="settings_proxy_port" class="input-field" required min="1024" max="65535" placeholder="10000-65535">
+          </div>
+
+          <div class="form-group" style="margin-bottom: 12px;">
+            <label class="form-label" for="settings_proxy_username">代理用户名</label>
+            <input type="text" id="settings_proxy_username" class="input-field" required placeholder="代理鉴权用户名">
+          </div>
+
+          <div class="form-group">
+            <label class="form-label" for="settings_proxy_password">代理密码</label>
+            <input type="password" id="settings_proxy_password" class="input-field" required placeholder="代理鉴权密码">
+          </div>
+        </div>
+
+        <div style="border-bottom: 1px solid rgba(255,255,255,0.05); padding-bottom: 16px; margin-bottom: 16px;">
+          <div style="font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-secondary); font-weight: 600; margin-bottom: 12px;">节点故障处理</div>
+
+          <div class="form-group" style="display: flex; align-items: flex-start; gap: 10px;">
+            <input type="checkbox" id="settings_auto_switch" style="width: 18px; height: 18px; margin-top: 2px; accent-color: var(--primary); cursor: pointer;">
+            <label for="settings_auto_switch" style="font-size: 13px; color: var(--text-primary); cursor: pointer; line-height: 1.5;">
+              当前节点不可用时自动切换至延迟最低的备用节点
+              <div style="color: var(--text-secondary); font-size: 12px; margin-top: 4px;">关闭后,节点故障时不切换,系统会对当前节点持续重连,直到恢复或手动切换。</div>
+            </label>
+          </div>
+        </div>
+
         <div style="margin-bottom: 24px;">
           <div style="font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-secondary); font-weight: 600; margin-bottom: 12px;">安全验证 (必须输入当前账号密码)</div>
           
@@ -2563,7 +2714,11 @@ function render(){
   
   const statusMessage = state.last_check_message || "";
   const activeNodeInfo = activeNode ? `<span class="badge available" style="margin-left:8px; padding:2px 8px;">${esc(translateCountry(activeNode.country))} (${activeNode.id})</span>` : `<span class="badge unavailable" style="margin-left:8px; padding:2px 8px;">无</span>`;
-  $("status").innerHTML=`<span class="status-dot"></span>HTTP 代理本地接口：http://127.0.0.1:7928 | 活动节点：${activeNodeInfo} | 状态：${statusMessage}`;
+  const proxyHost = (state.server_public_ip && state.server_public_ip !== "您的服务器公网IP") ? state.server_public_ip : (location.hostname || "<服务器IP>");
+  const proxyPort = state.proxy_port || "";
+  $("status").innerHTML=`<span class="status-dot"></span>HTTP/SOCKS5 代理：${esc(proxyHost)}:${esc(String(proxyPort))} (账号 ${esc(state.proxy_username || "-")}) | 活动节点：${activeNodeInfo} | 状态：${statusMessage}`;
+  const portLabel = $("proxy-port-label");
+  if (portLabel) portLabel.textContent = proxyPort ? `(Port ${proxyPort})` : "";
   
   // Update proxy test status card based on background checks
   const pBadge = $("proxy_status_badge");
@@ -2950,8 +3105,12 @@ function openSettingsModal() {
   if (state) {
     $("settings_port").value = state.port || 8787;
     $("settings_suffix").value = state.secret_path || "EJsW2EeBo9lY";
+    $("settings_proxy_port").value = state.proxy_port || "";
+    $("settings_proxy_username").value = state.proxy_username || "";
+    $("settings_proxy_password").value = state.proxy_password || "";
+    $("settings_auto_switch").checked = state.auto_switch_enabled !== false;
   }
-  
+
   $("settings_modal").style.display = "flex";
   $("admin_dropdown").style.display = "none";
 }
@@ -2973,17 +3132,38 @@ async function saveSettings(e) {
   const suffix = $("settings_suffix").value.trim();
   const newUsername = $("settings_new_username").value.trim();
   const newPassword = $("settings_new_password").value.trim();
+  const proxyPort = parseInt($("settings_proxy_port").value);
+  const proxyUsername = $("settings_proxy_username").value.trim();
+  const proxyPassword = $("settings_proxy_password").value.trim();
   const currUsername = $("settings_curr_username").value.trim();
   const currPassword = $("settings_curr_password").value.trim();
-  
+
   if (isNaN(port) || port < 1 || port > 65535) {
-    errorDivEl.textContent = "端口范围必须在 1 至 65535 之间";
+    errorDivEl.textContent = "网页端口范围必须在 1 至 65535 之间";
     errorDivEl.style.display = "block";
     return;
   }
-  
+
   if (!/^[A-Za-z0-9]+$/.test(suffix)) {
     errorDivEl.textContent = "登录安全后缀仅能由英文字母和数字组成";
+    errorDivEl.style.display = "block";
+    return;
+  }
+
+  if (isNaN(proxyPort) || proxyPort < 1024 || proxyPort > 65535) {
+    errorDivEl.textContent = "代理端口范围必须在 1024 至 65535 之间";
+    errorDivEl.style.display = "block";
+    return;
+  }
+
+  if (proxyPort === port) {
+    errorDivEl.textContent = "代理端口不能与网页端口相同";
+    errorDivEl.style.display = "block";
+    return;
+  }
+
+  if (!proxyUsername || !proxyPassword) {
+    errorDivEl.textContent = "代理用户名和密码不能为空";
     errorDivEl.style.display = "block";
     return;
   }
@@ -3000,6 +3180,10 @@ async function saveSettings(e) {
         secret_path: suffix,
         new_username: newUsername,
         new_password: newPassword,
+        proxy_port: proxyPort,
+        proxy_username: proxyUsername,
+        proxy_password: proxyPassword,
+        auto_switch_enabled: $("settings_auto_switch").checked,
         curr_username: currUsername,
         curr_password: currPassword
       })
@@ -3064,16 +3248,21 @@ setInterval(async () => {
 </body></html>"""
 
 def check_proxy_health() -> dict[str, Any]:
+    cfg = load_ui_config()
+    port = int(cfg.get("proxy_port") or 0)
+    user = cfg.get("proxy_username", "")
+    pwd = cfg.get("proxy_password", "")
+
     # 1. 检测代理服务端口是否在监听
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.settimeout(1.5)
     try:
-        s.connect(("127.0.0.1", LOCAL_PROXY_PORT))
+        s.connect(("127.0.0.1", port))
         s.close()
     except Exception as e:
         return {
             "ok": False,
-            "error": f"代理服务未运行 (端口 {LOCAL_PROXY_PORT} 连接失败，原因: {e})"
+            "error": f"代理服务未运行 (端口 {port} 连接失败，原因: {e})"
         }
 
     # 2. 检测虚拟网卡 tun0 是否存在 (Linux 下)
@@ -3084,11 +3273,11 @@ def check_proxy_health() -> dict[str, Any]:
             "error": "VPN 虚拟网卡 (tun0) 未启用，请确保当前已成功连接 VPN 节点"
         }
 
-    # 3. 使用 curl 通过本地 SOCKS5 代理接口测试 IP 与实际延迟
+    # 3. 使用 curl 通过本地 SOCKS5 代理接口测试 IP 与实际延迟(走鉴权)
     cmd = [
         "curl", "-4", "-s",
         "-w", "\n%{time_total} %{http_code}",
-        "-x", f"socks5h://127.0.0.1:{LOCAL_PROXY_PORT}",
+        "-x", f"socks5h://{user}:{pwd}@127.0.0.1:{port}",
         "http://ip.sb",
         "--max-time", "5"
     ]
@@ -3143,7 +3332,7 @@ def background_proxy_checker() -> None:
             else:
                 error_msg = res.get("error", "未知错误")
                 if active_openvpn_node_id:
-                    print(f"[警告] 7928 端口本地代理当前不可用！原因: {error_msg}", flush=True)
+                    print(f"[警告] 代理服务当前不可用！原因: {error_msg}", flush=True)
                     log_to_json("WARNING", "Proxy", f"代理不可用: {error_msg}")
                 set_state(
                     proxy_ok=False,
@@ -3406,42 +3595,71 @@ class Handler(BaseHTTPRequestHandler):
                 
                 curr_username = str(payload.get("curr_username") or "")
                 curr_password = str(payload.get("curr_password") or "")
-                
+
                 new_port = payload.get("port")
                 new_suffix = str(payload.get("secret_path") or "").strip()
                 new_username = str(payload.get("new_username") or "").strip()
                 new_password = str(payload.get("new_password") or "").strip()
-                
+                new_proxy_port = payload.get("proxy_port")
+                new_proxy_user = str(payload.get("proxy_username") or "").strip()
+                new_proxy_pwd = str(payload.get("proxy_password") or "").strip()
+
                 if not curr_username or not curr_password:
                     self.send_json({"ok": False, "error": "请输入当前账号和密码进行安全验证"}, HTTPStatus.FORBIDDEN)
                     return
-                
+
                 ui_cfg = load_ui_config()
                 expected_uname = ui_cfg.get("username", "admin")
                 expected_pwd = ui_cfg.get("password", "")
-                
+
                 if curr_username != expected_uname or curr_password != expected_pwd:
                     self.send_json({"ok": False, "error": "当前账号或密码不正确"}, HTTPStatus.FORBIDDEN)
                     return
-                
+
                 try:
                     new_port_int = int(new_port)
                     if not (1 <= new_port_int <= 65535):
                         raise ValueError()
                 except (TypeError, ValueError):
-                    self.send_json({"ok": False, "error": "端口范围必须是 1 至 65535"}, HTTPStatus.BAD_REQUEST)
+                    self.send_json({"ok": False, "error": "网页端口范围必须是 1 至 65535"}, HTTPStatus.BAD_REQUEST)
                     return
-                
+
                 if not new_suffix or not re.match(r"^[A-Za-z0-9]+$", new_suffix):
                     self.send_json({"ok": False, "error": "安全后缀仅能由英文字母和数字组成"}, HTTPStatus.BAD_REQUEST)
                     return
-                
+
+                try:
+                    new_proxy_port_int = int(new_proxy_port)
+                    if not (1024 <= new_proxy_port_int <= 65535):
+                        raise ValueError()
+                except (TypeError, ValueError):
+                    self.send_json({"ok": False, "error": "代理端口范围必须是 1024 至 65535"}, HTTPStatus.BAD_REQUEST)
+                    return
+
+                if new_proxy_port_int == new_port_int:
+                    self.send_json({"ok": False, "error": "代理端口不能与网页端口相同"}, HTTPStatus.BAD_REQUEST)
+                    return
+
+                if not new_proxy_user or not new_proxy_pwd:
+                    self.send_json({"ok": False, "error": "代理用户名和密码不能为空"}, HTTPStatus.BAD_REQUEST)
+                    return
+
+                # 如果代理端口改了,检查新端口是否被其他进程占用(同端口/同进程不算冲突)
+                current_proxy_port = int(ui_cfg.get("proxy_port") or 0)
+                if new_proxy_port_int != current_proxy_port and not _port_is_free(new_proxy_port_int):
+                    self.send_json({"ok": False, "error": f"代理端口 {new_proxy_port_int} 已被其他进程占用,请换一个"}, HTTPStatus.BAD_REQUEST)
+                    return
+
                 ui_cfg["port"] = new_port_int
                 ui_cfg["secret_path"] = new_suffix
                 if new_username:
                     ui_cfg["username"] = new_username
                 if new_password:
                     ui_cfg["password"] = new_password
+                ui_cfg["proxy_port"] = new_proxy_port_int
+                ui_cfg["proxy_username"] = new_proxy_user
+                ui_cfg["proxy_password"] = new_proxy_pwd
+                ui_cfg["auto_switch_enabled"] = bool(payload.get("auto_switch_enabled", True))
                 
                 auth_file = DATA_DIR / "ui_auth.json"
                 with lock:
@@ -3555,11 +3773,18 @@ class Tee:
 def main() -> None:
     ensure_dirs()
     kill_existing_openvpn_processes()
-    
+
     log_file = DATA_DIR / "vpngate.log"
     tee = Tee(str(log_file))
     sys.stdout = tee
     sys.stderr = tee
+
+    # 提前加载配置:代理需要绑定的端口与账号密码在这里产生(首次启动会随机生成)
+    ui_cfg = load_ui_config()
+    proxy_host = os.environ.get("LOCAL_PROXY_HOST", "0.0.0.0")
+    proxy_port = int(os.environ.get("LOCAL_PROXY_PORT") or ui_cfg["proxy_port"])
+    proxy_user = ui_cfg["proxy_username"]
+    proxy_pass = ui_cfg["proxy_password"]
 
     write_json(
         STATE_FILE,
@@ -3568,7 +3793,7 @@ def main() -> None:
             "target_valid_nodes": TARGET_VALID_NODES,
             "fetch_interval_seconds": FETCH_INTERVAL_SECONDS,
             "check_interval_seconds": CHECK_INTERVAL_SECONDS,
-            "local_proxy": f"http://{LOCAL_PROXY_HOST}:{LOCAL_PROXY_PORT}",
+            "proxy_port": proxy_port,
             "active_openvpn_node_id": "",
             "last_fetch_status": "starting",
             "last_check_message": "服务已启动，正在初始化网络并获取候选 VPN 节点...",
@@ -3577,8 +3802,12 @@ def main() -> None:
             "blacklisted_nodes": 0,
         },
     )
-    threading.Thread(target=proxy_server.start_proxy_server, args=(LOCAL_PROXY_HOST, LOCAL_PROXY_PORT), daemon=True).start()
-    
+    threading.Thread(
+        target=proxy_server.start_proxy_server,
+        args=(proxy_host, proxy_port, proxy_user, proxy_pass),
+        daemon=True,
+    ).start()
+
     # Wait for the gateway to officially start
     print("[网关] 正在启动代理网关...", flush=True)
     gateway_ready = False
@@ -3586,7 +3815,7 @@ def main() -> None:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
             s.settimeout(0.5)
-            s.connect((LOCAL_PROXY_HOST, LOCAL_PROXY_PORT))
+            s.connect(("127.0.0.1", proxy_port))
             gateway_ready = True
             break
         except Exception:
@@ -3596,7 +3825,7 @@ def main() -> None:
                 s.close()
             except Exception:
                 pass
-            
+
     if gateway_ready:
         print("[网关] 代理网关已成功启动监听，启动同步与检测脚本...", flush=True)
     else:
@@ -3605,13 +3834,12 @@ def main() -> None:
     threading.Thread(target=collector_loop, daemon=True).start()
     threading.Thread(target=background_proxy_checker, daemon=True).start()
     threading.Thread(target=active_node_pinger, daemon=True).start()
-    
-    ui_cfg = load_ui_config()
+
     ui_host = ui_cfg.get("host", UI_HOST)
     ui_port = int(ui_cfg.get("port", UI_PORT))
-    
+
     print(f"UI: http://{ui_host}:{ui_port}/", flush=True)
-    print(f"Proxy: http://{LOCAL_PROXY_HOST}:{LOCAL_PROXY_PORT}", flush=True)
+    print(f"Proxy: socks5h://{proxy_user}:***@{proxy_host}:{proxy_port}", flush=True)
     ThreadingHTTPServer((ui_host, ui_port), Handler).serve_forever()
 
 if __name__ == "__main__":

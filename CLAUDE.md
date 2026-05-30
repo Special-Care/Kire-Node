@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-KireNode is a VPN proxy gateway for Linux VPS (Ubuntu only). The Python service auto-fetches VPNGate nodes, dials one over OpenVPN onto a `tun0` adapter under a private policy-routing table, and exposes a local SOCKS5/HTTP proxy (port 7928) plus a web admin UI (port 8787). Designed to be the egress for an upstream Xray/3x-ui.
+KireNode is a VPN proxy gateway for Linux VPS (Ubuntu only). The Python service auto-fetches VPNGate nodes, dials one over OpenVPN onto a `tun0` adapter under a private policy-routing table, and exposes a SOCKS5/HTTP proxy (binds `0.0.0.0:<random high port>`, mandatory username/password auth — RFC 1929 for SOCKS5, HTTP Basic for HTTP) plus a web admin UI (port 8787). Designed to be the egress for an upstream Xray/3x-ui across the public internet.
 
 No build, no tests, no lint. Source is plain Python 3 executed by `systemd` on the target VPS.
 
@@ -47,7 +47,7 @@ Direct run for debugging (bypasses systemd; still needs root for `ip rule` / `op
 sudo python3 vpngate_manager.py
 ```
 
-Env knobs read at startup (see top of `vpngate_manager.py`): `FETCH_INTERVAL_SECONDS`, `CHECK_INTERVAL_SECONDS`, `TARGET_VALID_NODES`, `MAX_SCAN_ROWS`, `OPENVPN_TEST_TIMEOUT_SECONDS`, `OPENVPN_CMD`, `OPENVPN_AUTH_USER/PASS`, `LOCAL_PROXY_HOST/PORT`, `UI_HOST/PORT`, `VPNGATE_DATA_DIR`, `OPENVPN_UPSTREAM_SOCKS`, `OPENVPN_UPSTREAM_HTTP`.
+Env knobs read at startup (see top of `vpngate_manager.py`): `FETCH_INTERVAL_SECONDS`, `CHECK_INTERVAL_SECONDS`, `TARGET_VALID_NODES`, `MAX_SCAN_ROWS`, `OPENVPN_TEST_TIMEOUT_SECONDS`, `OPENVPN_CMD`, `OPENVPN_AUTH_USER/PASS`, `LOCAL_PROXY_HOST/PORT` (optional override; default host `0.0.0.0`, default port from `ui_auth.json` `proxy_port`), `UI_HOST/PORT`, `VPNGATE_DATA_DIR`, `OPENVPN_UPSTREAM_SOCKS`, `OPENVPN_UPSTREAM_HTTP`. The proxy port + credentials live in `vpngate_data/ui_auth.json` (`proxy_port`, `proxy_username`, `proxy_password`), auto-generated on first start and editable via the Web UI Settings panel.
 
 ## Architecture
 
@@ -58,7 +58,7 @@ Three Python files. There is no module-style package; `vpngate_manager.py` `impo
 `main()` boots, in this order:
 1. `kill_existing_openvpn_processes()` — `pkill -f "openvpn.*tun0|openvpn.*vpngate_data"` to clear stale OpenVPN from a previous crash.
 2. Redirects stdout/stderr through `Tee` to `vpngate.log`.
-3. Starts `proxy_server.start_proxy_server(127.0.0.1, 7928)` in a thread, waits up to 15 s for the port to listen.
+3. Starts `proxy_server.start_proxy_server("0.0.0.0", proxy_port, proxy_user, proxy_pass)` in a thread (port/creds from `ui_auth.json`), waits up to 15 s for the port to listen.
 4. Starts three daemon threads:
    - `collector_loop` — every `CHECK_INTERVAL_SECONDS` (~16 min) calls `maintain_valid_nodes`: fetch VPNGate API → merge into `nodes.json` → concurrently probe the top 10 with `test_multiple_nodes` (each gets a unique `tunN` device via `get_free_test_index`) → if no VPN is up, `auto_switch_node`.
    - `background_proxy_checker` — every 30 s runs `check_proxy_health` (curl through SOCKS5 to `ip.sb`, fallback `api.ipify.org`). On failure with an `active_openvpn_node_id`, marks the node unavailable and calls `auto_switch_node`.

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
+import base64
 import select
 import socket
 import threading
@@ -151,12 +152,29 @@ def relay(left: socket.socket, right: socket.socket) -> None:
                 return
             target.sendall(data)
 
-def socks5_client(client: socket.socket, first_byte: bytes) -> None:
+def socks5_client(client: socket.socket, first_byte: bytes, auth: tuple[str, str]) -> None:
     upstream = None
     try:
         methods_count = recv_exact(client, 1)[0]
-        recv_exact(client, methods_count)
-        client.sendall(b"\x05\x00")
+        methods = recv_exact(client, methods_count)
+        # 强制要求 RFC 1929 用户名/密码鉴权(method 0x02)
+        if 0x02 not in methods:
+            client.sendall(b"\x05\xff")
+            return
+        client.sendall(b"\x05\x02")
+        # 子协商
+        sub_ver = recv_exact(client, 1)[0]
+        if sub_ver != 0x01:
+            client.sendall(b"\x01\x01")
+            return
+        ulen = recv_exact(client, 1)[0]
+        uname = recv_exact(client, ulen).decode("utf-8", errors="replace") if ulen else ""
+        plen = recv_exact(client, 1)[0]
+        passwd = recv_exact(client, plen).decode("utf-8", errors="replace") if plen else ""
+        if uname != auth[0] or passwd != auth[1]:
+            client.sendall(b"\x01\x01")
+            return
+        client.sendall(b"\x01\x00")
         version, command, _, address_type = recv_exact(client, 4)
         if version != 5 or command != 1:
             client.sendall(b"\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00")
@@ -195,13 +213,28 @@ def read_http_header(client: socket.socket, first_byte: bytes) -> bytes:
         data += chunk
     return data
 
-def http_client(client: socket.socket, first_byte: bytes) -> None:
+def http_client(client: socket.socket, first_byte: bytes, auth: tuple[str, str]) -> None:
     upstream = None
     try:
         header = read_http_header(client, first_byte)
         head, rest = header.split(b"\r\n\r\n", 1)
         lines = head.decode("iso-8859-1", errors="replace").split("\r\n")
         method, target, version = lines[0].split(" ", 2)
+        # HTTP Basic 鉴权:检查 Proxy-Authorization 头
+        expected = "Basic " + base64.b64encode(f"{auth[0]}:{auth[1]}".encode("utf-8")).decode("ascii")
+        provided = None
+        for line in lines[1:]:
+            if line.lower().startswith("proxy-authorization:"):
+                provided = line.split(":", 1)[1].strip()
+                break
+        if provided != expected:
+            client.sendall(
+                b"HTTP/1.1 407 Proxy Authentication Required\r\n"
+                b"Proxy-Authenticate: Basic realm=\"proxy\"\r\n"
+                b"Content-Length: 0\r\n"
+                b"Connection: close\r\n\r\n"
+            )
+            return
         if method.upper() == "CONNECT":
             host, _, port_text = target.partition(":")
             port = parse_int(port_text) or 443
@@ -218,7 +251,7 @@ def http_client(client: socket.socket, first_byte: bytes) -> None:
             return
         port = parsed.port or (443 if parsed.scheme == "https" else 80)
         path = urllib.parse.urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
-        headers = [line for line in lines[1:] if not line.lower().startswith(("proxy-connection:", "connection:"))]
+        headers = [line for line in lines[1:] if not line.lower().startswith(("proxy-connection:", "connection:", "proxy-authorization:"))]
         request = f"{method} {path} {version}\r\n" + "\r\n".join(headers) + "\r\nConnection: close\r\n\r\n"
         upstream = create_connection((parsed.hostname, port), timeout=20)
         upstream.sendall(request.encode("iso-8859-1") + rest)
@@ -233,27 +266,31 @@ def http_client(client: socket.socket, first_byte: bytes) -> None:
         if upstream:
             upstream.close()
 
-def proxy_client(client: socket.socket, address: tuple[str, int]) -> None:
+def proxy_client(client: socket.socket, address: tuple[str, int], auth: tuple[str, str]) -> None:
     try:
         client.settimeout(30)
         first = recv_exact(client, 1)
         if first == b"\x05":
-            socks5_client(client, first)
+            socks5_client(client, first, auth)
         else:
-            http_client(client, first)
+            http_client(client, first, auth)
     except Exception:
         try:
             client.close()
         except OSError:
             pass
 
-def start_proxy_server(host: str, port: int) -> None:
+def start_proxy_server(host: str, port: int, username: str, password: str) -> None:
+    if not username or not password:
+        print("[ERROR] HTTP/SOCKS5 proxy refusing to start: empty credentials", flush=True)
+        return
+    auth = (username, password)
     try:
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server.bind((host, port))
         server.listen(256)
-        print(f"HTTP/SOCKS5 proxy listening on {host}:{port}", flush=True)
+        print(f"HTTP/SOCKS5 proxy listening on {host}:{port} (auth required)", flush=True)
     except Exception as e:
         print(f"[ERROR] Failed to start HTTP/SOCKS5 proxy on {host}:{port}: {e}", flush=True)
         return
@@ -261,7 +298,7 @@ def start_proxy_server(host: str, port: int) -> None:
     while True:
         try:
             client, address = server.accept()
-            threading.Thread(target=proxy_client, args=(client, address), daemon=True).start()
+            threading.Thread(target=proxy_client, args=(client, address, auth), daemon=True).start()
         except Exception as e:
             print(f"[ERROR] Proxy accept failed: {e}", flush=True)
             time.sleep(0.5)

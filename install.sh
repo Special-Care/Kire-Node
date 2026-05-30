@@ -141,7 +141,8 @@ def generate_random_suffix():
 def load_ui_cfg():
     import json
     path = "/opt/kire-node/vpngate_data/ui_auth.json"
-    cfg = {"host": "0.0.0.0", "port": 8787, "secret_path": "EJsW2EeBo9lY", "password": ""}
+    cfg = {"host": "0.0.0.0", "port": 8787, "secret_path": "EJsW2EeBo9lY", "password": "",
+           "proxy_port": 0, "proxy_username": "", "proxy_password": ""}
     if os.path.exists(path):
         try:
             with open(path, "r", encoding="utf-8") as f:
@@ -313,46 +314,60 @@ def print_status():
     cfg = load_ui_cfg()
     ui_port = cfg.get("port", 8787)
     secret_path = cfg.get("secret_path", "EJsW2EeBo9lY")
+    proxy_port = int(cfg.get("proxy_port") or 0)
+    proxy_user = cfg.get("proxy_username", "")
+    proxy_pwd = cfg.get("proxy_password", "")
     state = load_state()
     is_connecting = state.get("is_connecting", False)
-    
-    gateway_ok = check_port_listening(7928)
+
+    gateway_ok = check_port_listening(proxy_port) if proxy_port else False
     service_ok = check_service_active("kire-node.service")
     openvpn_ok = check_openvpn_process()
     pid = get_service_pid("kire-node.service")
-    
+
     active_ip, active_loc = get_active_node_info()
     latency = state.get("active_node_latency", "测试中...") if active_ip else "无活动连接"
-    
+
     green = "\033[1;32m"
     red = "\033[1;31m"
     reset = "\033[0m"
     bold = "\033[1m"
     yellow = "\033[1;33m"
-    
+
     backend_status = f"{green}[已激活] (PID: {pid}){reset}" if (service_ok and pid) else f"{red}[未启动]{reset}"
-    
+
     if is_connecting:
         gateway_status = f"{yellow}[切换中...]{reset}"
         openvpn_status = f"{yellow}[{state.get('active_node_latency') or '连接中'}...]{reset}"
     else:
         gateway_status = f"{green}[已激活]{reset}" if gateway_ok else f"{red}[未启动]{reset}"
         openvpn_status = f"{green}[已连接]{reset}" if openvpn_ok else f"{red}[未连接]{reset}"
-    
+
+    server_ip = get_public_ip()
+    masked_proxy_pwd = proxy_pwd if len(proxy_pwd) <= 4 else proxy_pwd[:3] + "********" + proxy_pwd[-2:]
+
     print_line("=======================================================")
     print_line(f"               {bold}KireNode 管理终端 v2.0{reset}                  ")
     print_line("=======================================================")
     print_line("【核心服务状态】")
-    print_line(format_line("代理网关 (Port 7928)", gateway_status))
+    print_line(format_line(f"代理网关 (Port {proxy_port or '?'})", gateway_status))
     print_line(format_line(f"管理后台 (Port {ui_port})", backend_status))
     print_line(format_line("连接核心 (OpenVPN)", openvpn_status))
-    
-    login_ip = "127.0.0.1" if cfg.get("host") == "127.0.0.1" else get_public_ip()
+
+    login_ip = "127.0.0.1" if cfg.get("host") == "127.0.0.1" else server_ip
     print_line(format_line("网页登录地址", f"{yellow}http://{login_ip}:{ui_port}/{secret_path}/{reset}"))
     print_line(format_line("网页管理账号", cfg.get("username", "未配置")))
     curr_pwd = cfg.get("password", "")
     masked_pwd = curr_pwd if len(curr_pwd) <= 4 else curr_pwd[:3] + "********" + curr_pwd[-2:]
     print_line(format_line("网页管理密码", masked_pwd))
+    print_line()
+    print_line("【远程代理接入信息】")
+    print_line(format_line("代理地址", f"{yellow}{server_ip}:{proxy_port}{reset}"))
+    print_line(format_line("代理用户名", proxy_user or "未配置"))
+    print_line(format_line("代理密码", masked_proxy_pwd or "未配置"))
+    auto_switch_on = cfg.get("auto_switch_enabled", True)
+    switch_label = f"{green}[启用]{reset} 故障时切换至延迟最低节点" if auto_switch_on else f"{yellow}[关闭]{reset} 故障时对当前节点持续重连"
+    print_line(format_line("故障自动切换", switch_label))
     print_line()
     print_line("【活动节点状态】")
     if is_connecting:
@@ -361,22 +376,22 @@ def print_status():
     elif active_ip:
         proxy_ip = state.get("proxy_ip", "-")
         proxy_latency = state.get("proxy_latency_ms", 0)
-        proxy_ok = state.get("proxy_ok", False)
-        
+        proxy_ok_flag = state.get("proxy_ok", False)
+
         print_line(format_line("节点 IP (入口)", active_ip))
         print_line(format_line("节点地区", active_loc))
         print_line(format_line("节点延迟 (直连测试)", latency))
-        if proxy_ok and proxy_ip and proxy_ip != "-":
+        if proxy_ok_flag and proxy_ip and proxy_ip != "-":
             print_line(format_line("出口 IP (出站)", proxy_ip))
-            print_line(format_line("本地代理延迟", f"{proxy_latency} ms" if proxy_latency else "检测中..."))
+            print_line(format_line("代理实测延迟", f"{proxy_latency} ms" if proxy_latency else "检测中..."))
         else:
             print_line(format_line("出口 IP (出站)", f"{red}[检测中/未就绪]{reset}"))
     else:
         print_line(format_line("节点状态", "无活动连接"))
     print_line()
-    print_line("【使用方法】")
-    print_line(f"  export http_proxy=socks5://127.0.0.1:7928")
-    print_line(f"  export https_proxy=socks5://127.0.0.1:7928")
+    print_line("【客户端使用方法】")
+    print_line(f"  curl -x socks5h://{proxy_user}:{proxy_pwd}@{server_ip}:{proxy_port} https://ip.sb")
+    print_line(f"  curl -x http://{proxy_user}:{proxy_pwd}@{server_ip}:{proxy_port} https://ip.sb")
     print_line("=======================================================")
 
 def start_service():
@@ -651,12 +666,17 @@ def getch_timeout(timeout=1.0):
 def get_status_state():
     cfg = load_ui_cfg()
     state = load_state()
+    proxy_port = int(cfg.get("proxy_port") or 0)
     return (
         cfg.get("port", 8787),
         cfg.get("secret_path", "EJsW2EeBo9lY"),
         cfg.get("username", "未配置"),
         cfg.get("password", ""),
         cfg.get("host", "0.0.0.0"),
+        proxy_port,
+        cfg.get("proxy_username", ""),
+        cfg.get("proxy_password", ""),
+        cfg.get("auto_switch_enabled", True),
         state.get("is_connecting", False),
         state.get("active_openvpn_node_id", ""),
         state.get("last_check_message", ""),
@@ -664,7 +684,7 @@ def get_status_state():
         state.get("proxy_ip", "-"),
         state.get("proxy_latency_ms", 0),
         state.get("proxy_ok", False),
-        check_port_listening(7928),
+        check_port_listening(proxy_port) if proxy_port else False,
         check_service_active("kire-node.service"),
         check_openvpn_process(),
         get_service_pid("kire-node.service")
@@ -810,14 +830,14 @@ AUTH_FILE="${INSTALL_DIR}/vpngate_data/ui_auth.json"
 mkdir -p "${INSTALL_DIR}/vpngate_data"
 
 if [ ! -f "$AUTH_FILE" ]; then
-    echo -e "\n${YELLOW}检测到是首次安装，是否需要自定义配置网页端参数（端口/安全后缀/登录账号密码）？${PLAIN}"
+    echo -e "\n${YELLOW}检测到是首次安装，是否需要自定义配置网页端参数（端口/安全后缀/登录账号密码）以及远程代理参数（端口/账号/密码）？${PLAIN}"
     read -p "是否自定义配置？[y/N]: " is_custom
-    
+
     # Initialize defaults
     UI_PORT=8787
     # generate random secret suffix (12 chars alphanumeric)
     SECRET_PATH=$(python3 -c "import random, string; print(''.join(random.choices(string.ascii_letters + string.digits, k=12)))")
-    # generate random password
+    # generate random password helpers
     UI_PASSWORD=$(python3 -c "
 import random, string
 chars = string.ascii_letters + string.digits
@@ -831,15 +851,49 @@ while True:
 import random, string
 chars = string.ascii_letters + string.digits
 while True:
-    uname = ''.join(random.choices(chars, k=12))
+    uname = ''.join(random.choices(chars, k=6))
     if uname[0].isalpha() and any(c.islower() for c in uname) and any(c.isupper() for c in uname) and any(c.isdigit() for c in uname):
         print(uname)
         break
 ")
+    # 代理端口:在 10000-65535 之间挑一个能 bind 的高位端口
+    PROXY_PORT=$(python3 -c "
+import random, socket
+for _ in range(50):
+    p = random.randint(10000, 65535)
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(('0.0.0.0', p))
+        print(p); break
+    except OSError:
+        continue
+    finally:
+        s.close()
+else:
+    print(random.randint(10000, 65535))
+")
+    PROXY_USERNAME=$(python3 -c "
+import random, string
+chars = string.ascii_letters + string.digits
+while True:
+    uname = ''.join(random.choices(chars, k=6))
+    if uname[0].isalpha() and any(c.islower() for c in uname) and any(c.isupper() for c in uname) and any(c.isdigit() for c in uname):
+        print(uname); break
+")
+    PROXY_PASSWORD=$(python3 -c "
+import random, string
+chars = string.ascii_letters + string.digits
+while True:
+    pwd = ''.join(random.choices(chars, k=12))
+    if any(c.islower() for c in pwd) and any(c.isupper() for c in pwd) and any(c.isdigit() for c in pwd):
+        print(pwd); break
+")
+    # 默认开启:节点故障时切换至延迟最低节点;关闭则对当前节点持续重连
+    AUTO_SWITCH="true"
 
     if [[ "$is_custom" =~ ^[Yy]$ ]]; then
-        # Step-by-step custom inputs
-        # 1. Custom port
+        # 1. Web UI port
         while true; do
             read -p "请输入自定义管理端口 [1-65535, 默认 8787]: " input_port
             if [ -z "$input_port" ]; then
@@ -853,8 +907,8 @@ while True:
                 echo -e "${RED}输入错误: 端口必须是 1 到 65535 之间的数字！${PLAIN}"
             fi
         done
-        
-        # 2. Custom suffix
+
+        # 2. Secret suffix
         while true; do
             read -p "请输入网页登录自定义安全后缀 [字母与数字组合, 默认随机]: " input_suffix
             if [ -z "$input_suffix" ]; then
@@ -867,15 +921,14 @@ while True:
                 echo -e "${RED}输入错误: 后缀仅能由英文字母和数字组成！${PLAIN}"
             fi
         done
-        
-        # 3. Custom login username and password
-        read -p "请输入登录账号 [默认 $UI_USERNAME]: " input_user
+
+        # 3. Web UI username/password
+        read -p "请输入网页登录账号 [默认 $UI_USERNAME]: " input_user
         if [ -n "$input_user" ]; then
             UI_USERNAME=$input_user
         fi
-        
         while true; do
-            read -p "请输入登录密码 [默认随机生成, 建议包含字母、数字与符号]: " input_pass
+            read -p "请输入网页登录密码 [默认随机生成, 建议包含字母、数字与符号]: " input_pass
             if [ -z "$input_pass" ]; then
                 break
             fi
@@ -886,19 +939,68 @@ while True:
                 echo -e "${RED}输入错误: 密码长度不能少于 4 位！${PLAIN}"
             fi
         done
+
+        # 4. Remote proxy port
+        while true; do
+            read -p "请输入远程代理端口 [1024-65535, 默认 $PROXY_PORT]: " input_pport
+            if [ -z "$input_pport" ]; then
+                break
+            fi
+            if [[ "$input_pport" =~ ^[0-9]+$ ]] && [ "$input_pport" -ge 1024 ] && [ "$input_pport" -le 65535 ]; then
+                if [ "$input_pport" = "$UI_PORT" ]; then
+                    echo -e "${RED}输入错误: 代理端口不能与网页端口相同！${PLAIN}"
+                else
+                    PROXY_PORT=$input_pport
+                    break
+                fi
+            else
+                echo -e "${RED}输入错误: 端口必须是 1024 到 65535 之间的数字！${PLAIN}"
+            fi
+        done
+
+        # 5. Remote proxy username
+        read -p "请输入远程代理用户名 [默认 $PROXY_USERNAME]: " input_puser
+        if [ -n "$input_puser" ]; then
+            PROXY_USERNAME=$input_puser
+        fi
+        # 6. Remote proxy password
+        while true; do
+            read -p "请输入远程代理密码 [默认随机生成]: " input_ppass
+            if [ -z "$input_ppass" ]; then
+                break
+            fi
+            if [ ${#input_ppass} -ge 4 ]; then
+                PROXY_PASSWORD=$input_ppass
+                break
+            else
+                echo -e "${RED}输入错误: 密码长度不能少于 4 位！${PLAIN}"
+            fi
+        done
+
+        # 7. Auto-switch on failure
+        read -p "节点故障时是否自动切换至延迟最低的备用节点? [Y/n] (N=关闭后将对当前节点持续重连): " input_autoswitch
+        if [[ "$input_autoswitch" =~ ^[Nn]$ ]]; then
+            AUTO_SWITCH="false"
+        fi
     fi
 
     # Write config JSON
-    python3 -c "
-import json
+    UI_PORT="$UI_PORT" SECRET_PATH="$SECRET_PATH" UI_USERNAME="$UI_USERNAME" UI_PASSWORD="$UI_PASSWORD" \
+    PROXY_PORT="$PROXY_PORT" PROXY_USERNAME="$PROXY_USERNAME" PROXY_PASSWORD="$PROXY_PASSWORD" \
+    AUTO_SWITCH="$AUTO_SWITCH" AUTH_FILE="$AUTH_FILE" python3 -c "
+import json, os
 cfg = {
     'host': '0.0.0.0',
-    'port': int('$UI_PORT'),
-    'secret_path': '$SECRET_PATH',
-    'username': '$UI_USERNAME',
-    'password': '$UI_PASSWORD'
+    'port': int(os.environ['UI_PORT']),
+    'secret_path': os.environ['SECRET_PATH'],
+    'username': os.environ['UI_USERNAME'],
+    'password': os.environ['UI_PASSWORD'],
+    'proxy_port': int(os.environ['PROXY_PORT']),
+    'proxy_username': os.environ['PROXY_USERNAME'],
+    'proxy_password': os.environ['PROXY_PASSWORD'],
+    'auto_switch_enabled': os.environ['AUTO_SWITCH'].lower() == 'true',
 }
-with open('$AUTH_FILE', 'w', encoding='utf-8') as f:
+with open(os.environ['AUTH_FILE'], 'w', encoding='utf-8') as f:
     json.dump(cfg, f, ensure_ascii=False, indent=2)
 "
 fi
@@ -946,12 +1048,18 @@ SECRET_PATH="EJsW2EeBo9lY"
 USERNAME="未配置"
 PASSWORD="未配置"
 UI_PORT=8787
+PROXY_PORT_DISPLAY="未配置"
+PROXY_USER_DISPLAY="未配置"
+PROXY_PWD_DISPLAY="未配置"
 AUTH_FILE="${INSTALL_DIR}/vpngate_data/ui_auth.json"
 if [ -f "$AUTH_FILE" ]; then
     SECRET_PATH=$(python3 -c "import json; print(json.load(open('$AUTH_FILE')).get('secret_path', 'EJsW2EeBo9lY'))" 2>/dev/null || echo "EJsW2EeBo9lY")
     USERNAME=$(python3 -c "import json; print(json.load(open('$AUTH_FILE')).get('username', '未配置'))" 2>/dev/null || echo "未配置")
     PASSWORD=$(python3 -c "import json; print(json.load(open('$AUTH_FILE')).get('password', '未配置'))" 2>/dev/null || echo "未配置")
     UI_PORT=$(python3 -c "import json; print(json.load(open('$AUTH_FILE')).get('port', 8787))" 2>/dev/null || echo "8787")
+    PROXY_PORT_DISPLAY=$(python3 -c "import json; print(json.load(open('$AUTH_FILE')).get('proxy_port', '未配置'))" 2>/dev/null || echo "未配置")
+    PROXY_USER_DISPLAY=$(python3 -c "import json; print(json.load(open('$AUTH_FILE')).get('proxy_username', '未配置'))" 2>/dev/null || echo "未配置")
+    PROXY_PWD_DISPLAY=$(python3 -c "import json; print(json.load(open('$AUTH_FILE')).get('proxy_password', '未配置'))" 2>/dev/null || echo "未配置")
 fi
 
 # Get VPS public IP
@@ -965,11 +1073,16 @@ echo -e "${GREEN}==========================================================${PLA
 echo -e "  * 网页控制面板:  ${BLUE}http://${PUBLIC_IP}:${UI_PORT}/${SECRET_PATH}/${PLAIN}"
 echo -e "  * 网页管理账号:  ${YELLOW}${USERNAME}${PLAIN}"
 echo -e "  * 网页管理密码:  ${YELLOW}${PASSWORD}${PLAIN}"
-echo -e "  * HTTP/SOCKS5 代理端口:  ${BLUE}http://127.0.0.1:7928/${PLAIN}"
+echo -e " --------------------------------------------------------"
+echo -e "  * 远程代理地址:  ${BLUE}${PUBLIC_IP}:${PROXY_PORT_DISPLAY}${PLAIN} (支持 SOCKS5 / HTTP)"
+echo -e "  * 代理用户名:    ${YELLOW}${PROXY_USER_DISPLAY}${PLAIN}"
+echo -e "  * 代理密码:      ${YELLOW}${PROXY_PWD_DISPLAY}${PLAIN}"
+echo -e "  * 测试命令:      ${YELLOW}curl -x socks5h://${PROXY_USER_DISPLAY}:${PROXY_PWD_DISPLAY}@${PUBLIC_IP}:${PROXY_PORT_DISPLAY} https://ip.sb${PLAIN}"
 echo -e " --------------------------------------------------------"
 echo -e "  * 快速状态指令:   ${YELLOW}kire status${PLAIN}  或  ${YELLOW}kire${PLAIN}"
 echo -e "  * 查看实时日志:   ${YELLOW}kire logs${PLAIN}"
 echo -e "  * 停止服务:       ${YELLOW}kire stop${PLAIN}"
 echo -e "  * 重启服务:       ${YELLOW}kire restart${PLAIN}"
 echo -e "=========================================================="
+echo -e "${RED}!!! 重要:代理已开放公网访问。请务必通过防火墙/安全组保护 ${PROXY_PORT_DISPLAY} 端口,只允许信任来源访问,避免被滥用导致 VPS 被封。${PLAIN}"
 echo
